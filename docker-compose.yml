@@ -1,3 +1,24 @@
+version: "3.9"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LOCAL SIMULATION — Full stack including ArgoCD CronWorkflow simulation
+#
+#  Kubernetes (kind) runs separately — see kind-setup.sh
+#
+#  ArgoCD is installed INSIDE kind cluster.
+#  The dlq-reprocessor below simulates the Argo CronWorkflow locally
+#  by hitting the ArgoCD API to submit a workflow on schedule.
+#
+#  Access points after setup:
+#    Frontend      → http://localhost:8080
+#    Backend API   → http://localhost:3000
+#    RabbitMQ UI   → http://localhost:15672  (admin/admin123)
+#    Prometheus    → http://localhost:9090
+#    Grafana       → http://localhost:3001   (admin/admin)
+#    ArgoCD UI     → http://localhost:8888   (admin/<see kind-setup.sh output>)
+#    Argo Workflows→ http://localhost:2746
+# ════════════════════════════════════════════════════════════════════════════
+
 networks:
   ecommerce:
     driver: bridge
@@ -10,13 +31,14 @@ volumes:
 
 services:
 
-  # ── PostgreSQL ─────────────────────────────────────────
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
+    container_name: ecommerce-postgres
     networks: [ecommerce]
     environment:
-      POSTGRES_DB: ecommerce
-      POSTGRES_USER: postgres
+      POSTGRES_DB:       ecommerce
+      POSTGRES_USER:     postgres
       POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
@@ -28,9 +50,10 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── RabbitMQ ───────────────────────────────────────────
+  # ── RabbitMQ ───────────────────────────────────────────────────────────────
   rabbitmq:
     image: rabbitmq:3.12-management
+    container_name: ecommerce-rabbitmq
     hostname: rabbitmq
     networks: [ecommerce]
     environment:
@@ -38,7 +61,8 @@ services:
       RABBITMQ_DEFAULT_PASS: admin123
     ports:
       - "5672:5672"
-      - "15672:15672"
+      - "15672:15672"   # Management UI
+      - "15692:15692"   # Prometheus metrics
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -47,18 +71,19 @@ services:
       timeout: 10s
       retries: 5
 
-  # ── Backend API ────────────────────────────────────────
+  # ── Backend API ────────────────────────────────────────────────────────────
   backend:
     build: ./app/backend
+    container_name: ecommerce-backend
     networks: [ecommerce]
     environment:
-      NODE_ENV: development
-      PORT: 3000
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: ecommerce
-      DB_USER: postgres
-      DB_PASS: postgres
+      NODE_ENV:   development
+      PORT:       3000
+      DB_HOST:    postgres
+      DB_PORT:    5432
+      DB_NAME:    ecommerce
+      DB_USER:    postgres
+      DB_PASS:    postgres
       RABBIT_URL: amqp://admin:admin123@rabbitmq:5672
     ports:
       - "3000:3000"
@@ -69,18 +94,18 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Worker (NO deploy, NO container_name) ──────────────
+  # ── Worker ─────────────────────────────────────────────────────────────────
   worker:
     build: ./app/worker
     networks: [ecommerce]
     environment:
-      NODE_ENV: development
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: ecommerce
-      DB_USER: postgres
-      DB_PASS: postgres
-      RABBIT_URL: amqp://admin:admin123@rabbitmq:5672
+      NODE_ENV:    development
+      DB_HOST:     postgres
+      DB_PORT:     5432
+      DB_NAME:     ecommerce
+      DB_USER:     postgres
+      DB_PASS:     postgres
+      RABBIT_URL:  amqp://admin:admin123@rabbitmq:5672
       MAX_RETRIES: 5
     depends_on:
       postgres:
@@ -91,39 +116,213 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  # ── Frontend ───────────────────────────────────────────
+  # ── Frontend ───────────────────────────────────────────────────────────────
   frontend:
     build: ./app/frontend
+    container_name: ecommerce-frontend
     networks: [ecommerce]
     ports:
-      - "8080:80"   # ✅ changed from 80 → avoids permission issues
+      - "8080:80"
     depends_on:
       - backend
     restart: unless-stopped
 
-  # ── Prometheus ─────────────────────────────────────────
+  # ── Prometheus ─────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.48.1
+    container_name: ecommerce-prometheus
     networks: [ecommerce]
     ports:
       - "9090:9090"
     volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
     restart: unless-stopped
 
-  # ── Grafana ────────────────────────────────────────────
+  # ── Grafana ────────────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:10.2.2
+    container_name: ecommerce-grafana
     networks: [ecommerce]
     ports:
       - "3001:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD:                admin
+      GF_USERS_ALLOW_SIGN_UP:                    "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/rabbitmq.json
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
     restart: unless-stopped
+
+  # ── ArgoCD Workflow Trigger ────────────────────────────────────────────────
+  # This service simulates the Argo CronWorkflow running inside Kubernetes.
+  # It runs on the same */5 * * * * schedule and submits a real workflow
+  # to the Argo Workflows server running inside the kind cluster.
+  #
+  # Production (EKS):                    Local simulation:
+  # ─────────────────────────────────    ──────────────────────────────────
+  # kind: CronWorkflow                   Alpine container with crond
+  # schedule: "*/5 * * * *"             */5 * * * * in crontab
+  # Argo controller submits workflow     curl → Argo Workflows API (localhost:2746)
+  # Runs dlq-reprocess.sh in pod        Same script mounted locally
+  # Reads RabbitMQ via K8s DNS          Reads RabbitMQ via host.docker.internal
+  #
+  # REQUIRES: kind cluster running with Argo Workflows installed
+  # Run kind-setup.sh BEFORE docker compose up
+  argo-cronworkflow-sim:
+    image: alpine:3.19
+    container_name: argo-cronworkflow-sim
+    networks: [ecommerce]
+    # host.docker.internal allows this container to reach:
+    #   - ArgoCD at localhost:8888
+    #   - Argo Workflows at localhost:2746
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      RABBIT_HOST:        rabbitmq
+      RABBIT_PORT:        "15672"
+      RABBIT_USER:        admin
+      RABBIT_PASS:        admin123
+      MAX_RETRIES:        "3"
+      MAX_REPROCESS:      "50"
+      # Argo Workflows server on kind cluster (port-forwarded to host)
+      ARGO_SERVER:        "http://host.docker.internal:2746"
+      # ArgoCD server on kind cluster (port-forwarded to host)
+      ARGOCD_SERVER:      "http://host.docker.internal:8888"
+      ARGOCD_USERNAME:    admin
+      ARGOCD_PASSWORD:    admin123
+    volumes:
+      - ./scripts/dlq-reprocess.sh:/scripts/dlq-reprocess.sh:ro
+      - ./argo/dlq-cronworkflow.yaml:/scripts/dlq-cronworkflow.yaml:ro
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl python3 bash jq
+
+        chmod +x /scripts/dlq-reprocess.sh
+
+        # ── Helper: submit workflow to Argo Workflows via API ────────────────
+        submit_argo_workflow() {
+          echo "[$(date)] Submitting DLQ workflow to Argo Workflows..."
+          RESPONSE=$(curl -s -o /tmp/argo_resp.json -w "%{http_code}" \
+            -X POST "${ARGO_SERVER}/api/v1/workflows/argo" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "workflow": {
+                "metadata": {
+                  "generateName": "dlq-reprocess-",
+                  "namespace": "argo"
+                },
+                "spec": {
+                  "entrypoint": "reprocess",
+                  "templates": [{
+                    "name": "reprocess",
+                    "container": {
+                      "image": "alpine:3.19",
+                      "command": ["sh", "-c"],
+                      "args": ["apk add --no-cache curl python3 bash && bash /scripts/dlq-reprocess.sh"],
+                      "env": [
+                        {"name": "RABBIT_HOST",   "value": "'"${RABBIT_HOST}"'"},
+                        {"name": "RABBIT_PORT",   "value": "'"${RABBIT_PORT}"'"},
+                        {"name": "RABBIT_USER",   "value": "'"${RABBIT_USER}"'"},
+                        {"name": "RABBIT_PASS",   "value": "'"${RABBIT_PASS}"'"},
+                        {"name": "MAX_RETRIES",   "value": "'"${MAX_RETRIES}"'"},
+                        {"name": "MAX_REPROCESS", "value": "'"${MAX_REPROCESS}"'"}
+                      ]
+                    }
+                  }]
+                }
+              }
+            }')
+
+          if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
+            WF_NAME=$(cat /tmp/argo_resp.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('metadata',{}).get('name','unknown'))" 2>/dev/null)
+            echo "[$(date)] ✅ Argo Workflow submitted: ${WF_NAME}"
+          else
+            echo "[$(date)] ⚠️  Argo Workflows API unavailable (HTTP ${RESPONSE}) — falling back to local script"
+            bash /scripts/dlq-reprocess.sh || true
+          fi
+        }
+
+        # ── Helper: sync ArgoCD app ──────────────────────────────────────────
+        sync_argocd() {
+          echo "[$(date)] Triggering ArgoCD sync..."
+          TOKEN=$(curl -s -X POST "${ARGOCD_SERVER}/api/v1/session" \
+            -H "Content-Type: application/json" \
+            -d '{"username":"'"${ARGOCD_USERNAME}"'","password":"'"${ARGOCD_PASSWORD}"'"}' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+
+          if [ -n "${TOKEN}" ]; then
+            curl -s -X POST "${ARGOCD_SERVER}/api/v1/applications/ecommerce-backend/sync" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{}' > /dev/null
+            echo "[$(date)] ✅ ArgoCD sync triggered"
+          else
+            echo "[$(date)] ⚠️  ArgoCD not reachable — skipping sync"
+          fi
+        }
+
+        # ── Write crontab ────────────────────────────────────────────────────
+        # Every 5 min: submit Argo workflow + sync ArgoCD (same as CronWorkflow)
+        cat > /etc/crontabs/root << 'CRON'
+        */5 * * * * /bin/sh /scripts/run-dlq-job.sh >> /var/log/dlq.log 2>&1
+        CRON
+
+        # Write the actual job script that cron calls
+        cat > /scripts/run-dlq-job.sh << 'JOBSCRIPT'
+        #!/bin/sh
+        export RABBIT_HOST="${RABBIT_HOST:-rabbitmq}"
+        export RABBIT_PORT="${RABBIT_PORT:-15672}"
+        export RABBIT_USER="${RABBIT_USER:-admin}"
+        export RABBIT_PASS="${RABBIT_PASS:-admin123}"
+        export MAX_RETRIES="${MAX_RETRIES:-3}"
+
+        echo "=== DLQ Job fired at $(date) ==="
+
+        # Try Argo Workflows API first, fall back to local script
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+          "http://host.docker.internal:2746/api/v1/info" 2>/dev/null || echo "000")
+
+        if [ "$RESPONSE" = "200" ]; then
+          echo "Argo Workflows reachable — submitting workflow"
+          curl -s -X POST "http://host.docker.internal:2746/api/v1/workflows/argo" \
+            -H "Content-Type: application/json" \
+            -d "{\"workflow\":{\"metadata\":{\"generateName\":\"dlq-reprocess-\",\"namespace\":\"argo\"},\"spec\":{\"entrypoint\":\"reprocess\",\"templates\":[{\"name\":\"reprocess\",\"container\":{\"image\":\"alpine:3.19\",\"command\":[\"sh\",\"-c\"],\"args\":[\"apk add --no-cache curl python3 bash && bash /scripts/dlq-reprocess.sh\"]}}]}}}"
+          echo "✅ Workflow submitted to Argo"
+        else
+          echo "Argo Workflows not reachable — running dlq-reprocess.sh locally"
+          bash /scripts/dlq-reprocess.sh || true
+        fi
+        JOBSCRIPT
+
+        chmod +x /scripts/run-dlq-job.sh
+
+        echo "╔══════════════════════════════════════════════════════════╗"
+        echo "║   Argo CronWorkflow Simulator                           ║"
+        echo "║   Schedule  : every 5 minutes  (*/5 * * * *)            ║"
+        echo "║   Argo WF   : ${ARGO_SERVER}                            ║"
+        echo "║   ArgoCD    : ${ARGOCD_SERVER}                          ║"
+        echo "║   RabbitMQ  : ${RABBIT_HOST}:${RABBIT_PORT}             ║"
+        echo "╚══════════════════════════════════════════════════════════╝"
+
+        echo ">>> Running initial DLQ check (startup)..."
+        sleep 20
+        submit_argo_workflow
+        sync_argocd
+
+        # Start foreground crond
+        crond -f -l 2
