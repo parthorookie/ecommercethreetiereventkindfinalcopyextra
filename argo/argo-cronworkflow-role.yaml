@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: argo
+  name: jenkins-argo-cronworkflow-binding
+subjects:
+  - kind: ServiceAccount
+    name: jenkins                     # ← your SA name in default ns
+    namespace: default                # ← where Jenkins actually runs
+roleRef:
+  kind: Role
+  name: jenkins-argo-cronworkflow-manager
+  apiGroup: rbac.authorization.k8s.io
