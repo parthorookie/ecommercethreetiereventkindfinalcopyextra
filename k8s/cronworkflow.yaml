@@ -1,0 +1,71 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: dlq-reprocess
+  namespace: argo
+spec:
+  schedule: "*/5 * * * *"
+  timezone: "Asia/Kolkata"
+  concurrencyPolicy: Forbid
+
+  workflowSpec:
+    entrypoint: dlq-job
+
+    templates:
+      - name: dlq-job
+        container:
+          image: alpine:3.19
+          command: [sh, -c]
+          args:
+            - |
+              apk add --no-cache curl python3
+
+              echo "==== DLQ PROCESSOR START ===="
+
+              RABBIT_HOST="host.docker.internal"
+              USER="admin"
+              PASS="admin123"
+
+              DLQ="orders.dlq"
+              MAIN="orders"
+
+              # Get DLQ count
+              DEPTH=$(curl -s -u $USER:$PASS \
+                http://$RABBIT_HOST:15672/api/queues/%2F/$DLQ \
+                | python3 -c "import sys,json; print(json.load(sys.stdin).get('messages',0))")
+
+              echo "DLQ depth: $DEPTH"
+
+              if [ "$DEPTH" -eq 0 ]; then
+                echo "No messages to process"
+                exit 0
+              fi
+
+              for i in $(seq 1 20); do
+                MSG=$(curl -s -u $USER:$PASS \
+                  -X POST \
+                  -H "Content-Type: application/json" \
+                  -d '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto"}' \
+                  http://$RABBIT_HOST:15672/api/queues/%2F/$DLQ/get)
+
+                COUNT=$(echo $MSG | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+
+                if [ "$COUNT" -eq 0 ]; then
+                  echo "No more messages"
+                  break
+                fi
+
+                PAYLOAD=$(echo $MSG | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['payload'])")
+
+                echo "Requeueing message..."
+
+                curl -s -u $USER:$PASS \
+                  -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"routing_key\":\"$MAIN\",\"payload\":$(echo $PAYLOAD | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"payload_encoding\":\"string\"}" \
+                  http://$RABBIT_HOST:15672/api/exchanges/%2F/amq.default/publish
+
+                sleep 1
+              done
+
+              echo "==== DONE ===="
