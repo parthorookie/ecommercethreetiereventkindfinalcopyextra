@@ -28,7 +28,7 @@ log "Checking prerequisites..."
 if ! command -v kind &>/dev/null; then
   log "Installing kind..."
   curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
-  chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+  chmod +x ./kind &&  mv ./kind /usr/local/bin/kind
   ok "kind installed"
 else
   ok "kind already installed: $(kind version)"
